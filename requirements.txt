@@ -1,0 +1,27 @@
+# Core Dependencies
+fastapi
+uvicorn
+pydantic
+python-dotenv
+
+# LLM and Orchestration
+groq
+langgraph
+langchain-core
+
+# MCP
+fastmcp
+
+# Orbital Mechanics
+sgp4
+requests
+python-dateutil
+
+# Vector Database and Embeddings
+chromadb
+sentence-transformers
+
+# Utilities
+numpy
+aiofiles
+httpx

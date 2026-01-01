@@ -1,0 +1,84 @@
+[
+  {
+    "id": "rhodian_jettison",
+    "title": "The Rhodian Law on Jettison",
+    "principle": "Losses incurred for the common good must be shared proportionally",
+    "application": "When debris is intentionally released to save other satellites, liability is distributed",
+    "keywords": [
+      "jettison",
+      "common good",
+      "proportional liability"
+    ]
+  },
+  {
+    "id": "derelict_vessel",
+    "title": "Derelict Vessel Doctrine",
+    "principle": "An abandoned vessel drifting without control bears reduced liability",
+    "application": "Non-maneuvering debris has limited fault in collisions",
+    "keywords": [
+      "derelict",
+      "abandoned",
+      "drifting",
+      "uncontrolled"
+    ]
+  },
+  {
+    "id": "last_clear_chance",
+    "title": "Last Clear Chance Doctrine",
+    "principle": "The party with final opportunity to avoid collision bears greater responsibility",
+    "application": "Active satellite with ability to maneuver has duty to avoid known debris",
+    "keywords": [
+      "last chance",
+      "avoidance",
+      "active control",
+      "duty"
+    ]
+  },
+  {
+    "id": "unlit_vessel",
+    "title": "Unlit Vessel Liability",
+    "principle": "Vessels without proper signals/lights share fault in collisions",
+    "application": "Dead satellites without transponders bear partial fault",
+    "keywords": [
+      "unlit",
+      "signals",
+      "transponder",
+      "identification"
+    ]
+  },
+  {
+    "id": "negligent_navigation",
+    "title": "Negligent Navigation",
+    "principle": "Failure to follow standard navigation procedures constitutes negligence",
+    "application": "Ignoring conjunction warnings or failing to maneuver when able",
+    "keywords": [
+      "negligence",
+      "navigation",
+      "warning",
+      "duty of care"
+    ]
+  },
+  {
+    "id": "absolute_liability_launch",
+    "title": "1972 Liability Convention - Article II",
+    "principle": "Launching state is absolutely liable for damage on Earth's surface or to aircraft",
+    "application": "Direct liability for damage caused by space object to ground or air",
+    "keywords": [
+      "absolute liability",
+      "launching state",
+      "surface damage"
+    ]
+  },
+  {
+    "id": "fault_liability_space",
+    "title": "1972 Liability Convention - Article III",
+    "principle": "Liability for damage in space requires proof of fault",
+    "application": "In-orbit collisions require establishing negligence or fault",
+    "keywords": [
+      "fault",
+      "in-orbit",
+      "negligence",
+      "space collision"
+    ]
+  }
+]
