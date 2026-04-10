@@ -68,7 +68,7 @@ LEO is cluttered with **36,000+ tracked debris objects** and growing. When two o
 
 ## Live Demo
 
-> **Frontend:** [orbital-jurist.netlify.app](https://orbital-jurist.netlify.app) *(replace with your URL)*  
+> **Frontend:** [orbital-jurist.netlify.app](https://orbital-jurist.netlify.app)
 > **Backend:** RunPod Serverless endpoint *(see [Deployment](#deployment))*
 
 **Quick test — ISS vs. Starlink Debris:**
