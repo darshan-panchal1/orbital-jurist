@@ -1,285 +1,389 @@
 """
-Main FastAPI Application for The Orbital Jurist
+Production FastAPI Application for The Orbital Jurist
 Provides REST API for autonomous space debris liability arbitration
 """
-import asyncio
-import sys
-import logging
-import uvicorn
-import importlib.util
-from pathlib import Path
+import time
+import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
 
-# Add project root to path
-sys.path.append(str(Path(__file__).parent))
+import uvicorn
+from fastapi import Depends, FastAPI, HTTPException, Request, Security
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security.api_key import APIKeyHeader
+from pydantic import BaseModel, Field, field_validator
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from config import settings
+from mcp_servers.registry import load_tools
+from utils.logging_config import get_logger, new_request_id, set_context
+from utils.resilience import all_circuit_breaker_statuses
 from workflow.graph import OrbitalJuristWorkflow
 
-# Configure Logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+logger = get_logger("api")
+
+# ── Rate limiter ──────────────────────────────────────────────────────────────
+limiter = Limiter(
+    key_func=get_remote_address,
+    default_limits=[settings.RATE_LIMIT_DEFAULT],
 )
-logger = logging.getLogger("OrbitalJuristAPI")
 
-def load_mcp_tools():
-    """
-    Load MCP server tools as Python modules
-    This simulates the MCP connection by importing the tools directly
-    """
-    logger.info("Loading MCP Tools...")
-    
-    try:
-        # Load orbital server tools
-        logger.debug("Loading module: orbital_server")
-        orbital_path = Path(__file__).parent / "mcp_servers" / "orbital_server.py"
-        orbital_spec = importlib.util.spec_from_file_location("orbital_server", orbital_path)
-        orbital_module = importlib.util.module_from_spec(orbital_spec)
-        orbital_spec.loader.exec_module(orbital_module)
-        
-        # Load legal server tools
-        logger.debug("Loading module: legal_server")
-        legal_path = Path(__file__).parent / "mcp_servers" / "legal_server.py"
-        legal_spec = importlib.util.spec_from_file_location("legal_server", legal_path)
-        legal_module = importlib.util.module_from_spec(legal_spec)
-        legal_spec.loader.exec_module(legal_module)
-        
-        # Extract tool functions
-        def extract_callable(tool):
-            if hasattr(tool, 'fn'):
-                return tool.fn
-            elif callable(tool):
-                return tool
-            else:
-                raise ValueError(f"Cannot extract callable from {tool}")
-        
-        orbital_tools = {
-            "get_tle_data": extract_callable(orbital_module.get_tle_data),
-            "propagate_orbit": extract_callable(orbital_module.propagate_orbit),
-            "calculate_miss_distance": extract_callable(orbital_module.calculate_miss_distance),
-            "detect_maneuver": extract_callable(orbital_module.detect_maneuver)
-        }
-        
-        legal_tools = {
-            "search_maritime_precedents": extract_callable(legal_module.search_maritime_precedents),
-            "get_liability_convention_article": extract_callable(legal_module.get_liability_convention_article),
-            "analyze_liability_factors": extract_callable(legal_module.analyze_liability_factors),
-            "get_all_precedents": extract_callable(legal_module.get_all_precedents),
-            "calculate_damages_estimate": extract_callable(legal_module.calculate_damages_estimate)
-        }
-        
-        logger.info(f"MCP Tools Loaded Successfully. Orbital: {len(orbital_tools)}, Legal: {len(legal_tools)}")
-        return orbital_tools, legal_tools
-        
-    except Exception as e:
-        logger.critical(f"Failed to load MCP tools: {e}")
-        raise e
+# ── Optional API key auth ─────────────────────────────────────────────────────
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-# Initialize FastAPI app
-logger.info("Initializing FastAPI Application...")
+
+def verify_api_key(key: Optional[str] = Security(_api_key_header)) -> None:
+    """No-op when INTERNAL_API_KEY is unset; enforces key when set."""
+    if settings.INTERNAL_API_KEY and key != settings.INTERNAL_API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid or missing API key")
+
+
+# ── TTL-aware in-memory results store ─────────────────────────────────────────
+class _ResultsStore:
+    def __init__(self, ttl: int = settings.RESULTS_TTL_SECONDS):
+        self._store: dict = {}
+        self._ttl   = ttl
+
+    def put(self, key: str, value: dict) -> None:
+        self._store[key] = {"data": value, "ts": time.monotonic()}
+
+    def get(self, key: str) -> Optional[dict]:
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        if time.monotonic() - entry["ts"] > self._ttl:
+            del self._store[key]
+            return None
+        return entry["data"]
+
+    def evict_expired(self) -> int:
+        cutoff  = time.monotonic() - self._ttl
+        expired = [k for k, v in self._store.items() if v["ts"] < cutoff]
+        for k in expired:
+            del self._store[k]
+        return len(expired)
+
+
+_results = _ResultsStore()
+
+# ── Application lifecycle ──────────────────────────────────────────────────────
+_workflow: Optional[OrbitalJuristWorkflow] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _workflow
+    logger.info("Startup — loading MCP tools")
+    orbital_tools, legal_tools = load_tools()
+    _workflow = OrbitalJuristWorkflow(orbital_tools, legal_tools)
+    logger.info("Startup complete")
+    yield
+    logger.info("Shutdown")
+
+
 app = FastAPI(
     title=settings.API_TITLE,
     version=settings.API_VERSION,
-    description="Autonomous arbitration system for space debris liability using orbital mechanics and maritime law"
+    description="Autonomous arbitration system for space debris liability using orbital mechanics and maritime law",
+    lifespan=lifespan,
 )
 
-# Load MCP tools
-orbital_tools, legal_tools = load_mcp_tools()
+# ── CORS Configuration ────────────────────────────────────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Note: Change to your specific frontend domains in production!
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Initialize workflow
-logger.info("Initializing Workflow Graph...")
-workflow = OrbitalJuristWorkflow(orbital_tools, legal_tools)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# Request/Response Models
+
+# ── Request context middleware ─────────────────────────────────────────────────
+@app.middleware("http")
+async def request_context_middleware(request: Request, call_next):
+    rid = new_request_id()
+    set_context(
+        request_id=rid,
+        trace_id=request.headers.get("X-Trace-Id", rid),
+    )
+    request.state.request_id = rid
+    t0       = time.monotonic()
+    response = await call_next(request)
+    elapsed  = round((time.monotonic() - t0) * 1000, 1)
+    response.headers["X-Request-Id"] = rid
+    logger.info(
+        "HTTP",
+        extra={
+            "method": request.method,
+            "path":   request.url.path,
+            "status": response.status_code,
+            "ms":     elapsed,
+        },
+    )
+    return response
+
+
+# ── Request/Response Models ────────────────────────────────────────────────────
 class ConjunctionAnalysisRequest(BaseModel):
     """Request model for conjunction analysis"""
-    object_1_id: int = Field(..., description="NORAD catalog ID of first object", example=25544)
-    object_2_id: int = Field(..., description="NORAD catalog ID of second object", example=99999)
+    object_1_id: int = Field(
+        ..., ge=1, le=90000,
+        description="NORAD catalog ID of first object",
+        json_schema_extra={"example": 25544},
+    )
+    object_2_id: int = Field(
+        ..., ge=1, le=90000,
+        description="NORAD catalog ID of second object",
+        json_schema_extra={"example": 43013},
+    )
     conjunction_time: Optional[str] = Field(
         None,
         description="ISO format datetime of conjunction (defaults to now)",
-        example="2025-01-15T12:00:00Z"
+        json_schema_extra={"example": "2025-01-15T12:00:00Z"}
     )
+
+    @field_validator("conjunction_time")
+    @classmethod
+    def validate_iso_time(cls, v):
+        if v is None:
+            return v
+        try:
+            datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError(
+                "conjunction_time must be ISO-8601 (e.g. 2025-06-15T12:00:00Z)"
+            )
+        return v
+
+    @field_validator("object_2_id")
+    @classmethod
+    def different_objects(cls, v, info):
+        if info.data.get("object_1_id") == v:
+            raise ValueError("object_1_id and object_2_id must differ")
+        return v
+
 
 class JudgmentResponse(BaseModel):
     """Response model for liability judgment"""
-    success: bool
-    case_id: str
-    judgment: Optional[dict]
-    error: Optional[str]
+    success:  bool
+    case_id:  str
+    judgment: Optional[dict] = None
+    error:    Optional[str]  = None
 
-# In-memory storage for analysis results
-analysis_results = {}
 
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    """Middleware to log all incoming requests"""
-    logger.info(f"Incoming Request: {request.method} {request.url.path}")
-    response = await call_next(request)
-    logger.info(f"Response Status: {response.status_code}")
-    return response
+# ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
-        "service": "Orbital Jurist",
-        "version": settings.API_VERSION,
+        "service":  "Orbital Jurist",
+        "version":  settings.API_VERSION,
         "description": "Autonomous Space Debris Liability Arbiter",
         "endpoints": {
-            "analyze": "/api/v1/analyze",
-            "status": "/api/v1/status/{case_id}",
-            "precedents": "/api/v1/precedents",
-            "health": "/health"
-        }
+            "analyze":    "POST /api/v1/analyze",
+            "status":     "GET  /api/v1/status/{case_id}",
+            "precedents": "GET  /api/v1/precedents",
+            "health":     "GET  /health",
+        },
     }
+
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
     logger.debug("Health check requested")
     return {
-        "status": "healthy",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "groq_configured": bool(settings.GROQ_API_KEY),
-        "mcp_tools_loaded": {
-            "orbital": len(orbital_tools),
-            "legal": len(legal_tools)
-        }
+        "status":           "healthy",
+        "timestamp":        datetime.now(timezone.utc).isoformat(),
+        "groq_configured":  bool(settings.GROQ_API_KEY),
+        "circuit_breakers": all_circuit_breaker_statuses(),
+        "mcp_tools_loaded": _workflow is not None,
     }
 
-@app.post("/api/v1/analyze", response_model=JudgmentResponse)
-async def analyze_conjunction(request: ConjunctionAnalysisRequest, background_tasks: BackgroundTasks):
+
+@app.post(
+    "/api/v1/analyze",
+    response_model=JudgmentResponse,
+    dependencies=[Depends(verify_api_key)],
+)
+@limiter.limit(settings.RATE_LIMIT_ANALYZE)
+async def analyze_conjunction(
+    request: Request,
+    body:    ConjunctionAnalysisRequest,
+):
     """
     Analyze a conjunction event and render liability judgment
     """
-    # Default conjunction time to now if not provided
-    conjunction_time = request.conjunction_time or datetime.now(timezone.utc).isoformat()
-    
-    # Generate case ID
-    case_id = f"OJ-{request.object_1_id}-{request.object_2_id}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-    
-    logger.info(f"[API] Processing New Analysis Request. CaseID: {case_id}")
-    logger.debug(f"[API] Request Details: Obj1={request.object_1_id}, Obj2={request.object_2_id}, Time={conjunction_time}")
-    
+    if _workflow is None:
+        raise HTTPException(status_code=503, detail="Workflow not initialised")
+
+    conjunction_time = body.conjunction_time or datetime.now(timezone.utc).isoformat()
+    case_id  = f"OJ-{body.object_1_id}-{body.object_2_id}-{uuid.uuid4().hex[:8]}"
+    trace_id = request.headers.get("X-Trace-Id", uuid.uuid4().hex)
+
+    set_context(case_id=case_id, trace_id=trace_id)
+    logger.info(
+        "Analysis request received",
+        extra={"obj1": body.object_1_id, "obj2": body.object_2_id, "case_id": case_id},
+    )
+
     try:
-        # Run the workflow
-        logger.info(f"[API] executing workflow for {case_id}...")
-        final_state = workflow.run_sync(
-            object_1_id=request.object_1_id,
-            object_2_id=request.object_2_id,
-            conjunction_time=conjunction_time
-        )
-        
-        if final_state.get("error_message"):
-            logger.error(f"[API] Workflow failed for {case_id}: {final_state['error_message']}")
-            raise HTTPException(status_code=500, detail=final_state["error_message"])
-        
-        # Store result
-        analysis_results[case_id] = final_state
-        logger.info(f"[API] Analysis Complete. Result Stored.")
-        
-        return JudgmentResponse(
-            success=True,
+        final = await _workflow.run(
+            object_1_id=body.object_1_id,
+            object_2_id=body.object_2_id,
+            conjunction_time=conjunction_time,
             case_id=case_id,
-            judgment=final_state.get("final_judgment"),
-            error=None
+            trace_id=trace_id,
         )
-    
-    except Exception as e:
-        logger.exception(f"[API] Unexpected Error during analysis for {case_id}")
+    except Exception as exc:
+        logger.exception("Workflow error", extra={"error": str(exc)})
+        return JudgmentResponse(success=False, case_id=case_id, error=str(exc))
+
+    if final.get("error_message"):
         return JudgmentResponse(
             success=False,
             case_id=case_id,
-            judgment=None,
-            error=str(e)
+            error=final["error_message"],
         )
 
-@app.get("/api/v1/status/{case_id}")
+    _results.put(case_id, final)
+    logger.info("Analysis complete", extra={"case_id": case_id})
+
+    return JudgmentResponse(
+        success=True,
+        case_id=case_id,
+        judgment=final.get("final_judgment"),
+    )
+
+
+@app.get(
+    "/api/v1/status/{case_id}",
+    dependencies=[Depends(verify_api_key)],
+)
 async def get_case_status(case_id: str):
     """
     Get the status and results of a specific case
     """
-    logger.debug(f"[API] Checking status for CaseID: {case_id}")
-    
-    if case_id not in analysis_results:
-        logger.warning(f"[API] CaseID {case_id} not found")
-        raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
-    
-    result = analysis_results[case_id]
-    
+    logger.debug("Status check", extra={"case_id": case_id})
+
+    result = _results.get(case_id)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Case {case_id!r} not found or expired",
+        )
+
     return {
-        "case_id": case_id,
-        "status": "complete" if result.get("verdict_complete") else "in_progress",
-        "current_step": result.get("current_step"),
+        "case_id":          case_id,
+        "status":           "complete" if result.get("verdict_complete") else "in_progress",
+        "current_step":     result.get("current_step"),
         "physics_complete": result.get("physics_complete", False),
-        "legal_complete": result.get("legal_complete", False),
+        "legal_complete":   result.get("legal_complete",   False),
         "verdict_complete": result.get("verdict_complete", False),
-        "judgment": result.get("final_judgment"),
-        "error": result.get("error_message")
+        "judgment":         result.get("final_judgment"),
+        "error":            result.get("error_message"),
     }
 
-@app.get("/api/v1/precedents")
+
+@app.get(
+    "/api/v1/precedents",
+    dependencies=[Depends(verify_api_key)],
+)
 async def list_precedents():
     """
     List all available legal precedents in the database
     """
-    logger.info("[API] Fetching full precedent list")
-    result = legal_tools["get_all_precedents"]()
-    return result
+    logger.info("Fetching full precedent list")
+    if _workflow is None:
+        raise HTTPException(status_code=503, detail="Workflow not initialised")
+    return _workflow.legal_tools["get_all_precedents"]()
 
-@app.post("/api/v1/tle/{norad_id}")
+
+@app.post(
+    "/api/v1/tle/{norad_id}",
+    dependencies=[Depends(verify_api_key)],
+)
 async def get_tle(norad_id: int):
     """
     Fetch TLE data for a specific satellite
     """
-    logger.info(f"[API] Fetching TLE for {norad_id}")
+    logger.info("TLE fetch requested", extra={"norad_id": norad_id})
+    if _workflow is None:
+        raise HTTPException(status_code=503, detail="Workflow not initialised")
     try:
-        result = orbital_tools["get_tle_data"](norad_id=norad_id)
+        result = _workflow.orbital_tools["get_tle_data"](norad_id=norad_id)
         if not result.get("success"):
-            logger.warning(f"[API] TLE not found for {norad_id}")
-            raise HTTPException(status_code=404, detail=result.get("error", "TLE not found"))
+            raise HTTPException(
+                status_code=404,
+                detail=result.get("error", "TLE not found"),
+            )
         return result
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"[API] Error fetching TLE: {e}")
+        logger.error("TLE fetch error", extra={"norad_id": norad_id, "error": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/v1/propagate")
+
+@app.post(
+    "/api/v1/propagate",
+    dependencies=[Depends(verify_api_key)],
+)
 async def propagate_satellite(norad_id: int, target_time: str):
     """
     Propagate a satellite's orbit to a specific time
     """
-    logger.info(f"[API] Propagating orbit for {norad_id} to {target_time}")
+    logger.info("Propagation requested",
+                extra={"norad_id": norad_id, "target_time": target_time})
+    if _workflow is None:
+        raise HTTPException(status_code=503, detail="Workflow not initialised")
     try:
-        result = orbital_tools["propagate_orbit"](
+        result = _workflow.orbital_tools["propagate_orbit"](
             norad_id=norad_id,
-            target_time=target_time
+            target_time=target_time,
         )
         if not result.get("success"):
-            logger.error(f"[API] Propagation failed: {result.get('error')}")
-            raise HTTPException(status_code=500, detail=result.get("error", "Propagation failed"))
+            raise HTTPException(
+                status_code=500,
+                detail=result.get("error", "Propagation failed"),
+            )
         return result
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"[API] Exception during propagation: {e}")
+        logger.error("Propagation error",
+                     extra={"norad_id": norad_id, "error": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.get(
+    "/admin/evict",
+    include_in_schema=False,
+    dependencies=[Depends(verify_api_key)],
+)
+async def manual_evict():
+    """Manually evict expired results from the in-memory store"""
+    n = _results.evict_expired()
+    return {"evicted": n}
+
+
 @app.exception_handler(Exception)
-async def global_exception_handler(request, exc):
+async def global_exception_handler(request: Request, exc: Exception):
     """Global exception handler"""
-    logger.critical(f"Global Exception caught: {exc}")
+    logger.error("Unhandled exception", extra={"error": str(exc)})
     return JSONResponse(
         status_code=500,
-        content={
-            "error": "Internal server error",
-            "detail": str(exc)
-        }
+        content={"error": "Internal server error"},
     )
+
 
 def main():
     """Main entry point"""
@@ -292,21 +396,19 @@ Version: {settings.API_VERSION}
 API Server: http://{settings.API_HOST}:{settings.API_PORT}
 Docs: http://{settings.API_HOST}:{settings.API_PORT}/docs
 {'='*80}
-
-MCP Tools Loaded:
-  Orbital Mechanics: {len(orbital_tools)} tools
-  Legal Database: {len(legal_tools)} tools
-
-Groq API: {'✓ Configured' if settings.GROQ_API_KEY else '✗ NOT CONFIGURED'}
+Groq API: {'Configured' if settings.GROQ_API_KEY else 'NOT CONFIGURED'}
+Auth:     {'Enabled (X-API-Key)' if settings.INTERNAL_API_KEY else 'Disabled'}
 {'='*80}
 """)
-    
+
     uvicorn.run(
-        app,
+        "main:app",
         host=settings.API_HOST,
         port=settings.API_PORT,
-        log_level="warning" # Suppress uvicorn's default logs in favor of ours, or set to 'info'
+        log_config=None,   # suppress uvicorn's default logging — we own the root logger
+        workers=1,         # LangGraph graph state is in-process; use 1 worker
     )
+
 
 if __name__ == "__main__":
     main()

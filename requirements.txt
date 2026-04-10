@@ -1,27 +1,38 @@
-# Core Dependencies
-fastapi
-uvicorn
-pydantic
-python-dotenv
+# Core
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.0.0
+pydantic-settings>=2.3.0
+python-dotenv>=1.0.0
 
 # LLM and Orchestration
-groq
-langgraph
-langchain-core
+groq>=0.9.0
+langgraph>=0.2.0
+langchain-core>=0.2.0
 
 # MCP
-fastmcp
+fastmcp>=0.9.0
 
 # Orbital Mechanics
-sgp4
-requests
-python-dateutil
+sgp4>=2.23
+python-dateutil>=2.8.0
 
-# Vector Database and Embeddings
-chromadb
-sentence-transformers
+# HTTP (async + sync)
+httpx>=0.27.0
+requests>=2.31.0
+
+# Resilience
+tenacity>=8.3.0
+
+# Caching
+cachetools>=5.3.0
+
+# Rate Limiting
+slowapi>=0.1.9
+
+# Observability
+python-json-logger>=2.0.7
 
 # Utilities
-numpy
-aiofiles
-httpx
+numpy>=1.26.0
+aiofiles>=23.2.0

@@ -3,179 +3,176 @@ MCP Server for Orbital Mechanics Tools
 Provides satellite propagation and collision analysis capabilities
 """
 import sys
-import logging
+import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+from cachetools import TTLCache
+from fastmcp import FastMCP
+from sgp4.api import Satrec, jday
+
 sys.path.append(str(Path(__file__).parent.parent))
 
-from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Tuple
-import numpy as np
-from sgp4.api import Satrec, jday
-from sgp4 import exporter
-from fastmcp import FastMCP
+from config import settings
 from utils.data_loader import CelesTrakClient
+from utils.logging_config import get_logger
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger("orbital_mcp_server")
+logger = get_logger("orbital_mcp_server")
 
 # Initialize FastMCP server
 logger.info("Initializing FastMCP server 'orbital_mechanics_server'...")
 mcp = FastMCP("orbital_mechanics_server")
 
-# Cache for TLE data
-tle_cache = {}
+# ── TLE cache (thread-safe, TTL-backed) ──────────────────────────────────────
+_tle_cache: TTLCache = TTLCache(maxsize=512, ttl=settings.CELESTRAK_CACHE_TTL_S)
+_tle_cache_lock = threading.Lock()
+
 
 def parse_tle(line1: str, line2: str) -> Satrec:
     """Parse TLE and return satellite object"""
     return Satrec.twoline2rv(line1, line2)
 
+
 def datetime_to_jd(dt: datetime) -> Tuple[float, float]:
     """Convert datetime to Julian date"""
-    return jday(dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second + dt.microsecond/1e6)
+    return jday(
+        dt.year, dt.month, dt.day,
+        dt.hour, dt.minute,
+        dt.second + dt.microsecond / 1e6,
+    )
 
-# Define internal functions first (not decorated)
+
+# ── Internal TLE fetch — delegates to shared CelesTrakClient ─────────────────
+
 def _get_tle_data_internal(norad_id: int) -> Dict:
-    """Internal function for fetching TLE data (not decorated)"""
-    logger.debug(f"Internal TLE fetch requested for NORAD ID: {norad_id}")
-    
-    # Check cache first
-    if norad_id in tle_cache:
-        logger.debug(f"TLE cache hit for NORAD ID: {norad_id}")
-        return tle_cache[norad_id]
-    
-    # Fetch from CelesTrak
-    logger.info(f"Fetching TLE for NORAD ID {norad_id} from CelesTrak...")
-    try:
-        tle_data = CelesTrakClient.fetch_tle(norad_id)
-    except Exception as e:
-        logger.error(f"Error calling CelesTrakClient: {e}", exc_info=True)
+    """
+    Delegates to CelesTrakClient which owns the TTL cache, retry, and
+    circuit-breaker logic. Wraps result in the legacy dict shape so all
+    callers remain unchanged.
+    """
+    tle = CelesTrakClient.fetch_tle(norad_id)
+    if tle is None:
         return {
-            "success": False,
-            "error": f"Exception during TLE fetch: {str(e)}",
-            "norad_id": norad_id
+            "success":  False,
+            "error":    f"Could not fetch TLE for NORAD ID {norad_id}",
+            "norad_id": norad_id,
         }
     
-    if tle_data is None:
-        logger.warning(f"Could not fetch TLE for NORAD ID {norad_id} (Data is None)")
-        return {
-            "success": False,
-            "error": f"Could not fetch TLE for NORAD ID {norad_id}",
-            "norad_id": norad_id
-        }
-    
-    # Cache the result
-    tle_cache[norad_id] = {
-        "success": True,
-        "norad_id": norad_id,
-        "name": tle_data["name"],
-        "line1": tle_data["line1"],
-        "line2": tle_data["line2"],
-        "epoch": tle_data["epoch"]
-    }
-    logger.info(f"TLE cached successfully for '{tle_data['name']}' (ID: {norad_id})")
-    
-    return tle_cache[norad_id]
+    # FIX: Ensure both 'name' and 'sat_name' exist in the returned dictionary
+    # to prevent KeyErrors across all tools regardless of what the client returns.
+    raw_name = tle.get("sat_name") or tle.get("name") or f"NORAD {norad_id}"
+    tle["name"] = raw_name
+    tle["sat_name"] = raw_name
 
-# Now create the decorated version
+    return {"success": True, **tle}
+
+
+# ── Tools ─────────────────────────────────────────────────────────────────────
+
 @mcp.tool()
 def get_tle_data(norad_id: int) -> Dict:
     """
     Fetch TLE data for a satellite from CelesTrak
-    
+
     Args:
         norad_id: NORAD catalog number
-    
+
     Returns:
         Dictionary containing TLE data and metadata
     """
-    logger.info(f"Tool 'get_tle_data' invoked. NORAD ID: {norad_id}")
+    logger.info("Tool 'get_tle_data' invoked", extra={"norad_id": norad_id})
     result = _get_tle_data_internal(norad_id)
-    logger.info(f"Tool 'get_tle_data' completed. Success: {result.get('success')}")
+    logger.info("Tool 'get_tle_data' completed",
+                extra={"norad_id": norad_id, "success": result.get("success")})
     return result
+
 
 @mcp.tool()
 def propagate_orbit(norad_id: int, target_time: str) -> Dict:
     """
     Propagate satellite orbit to a specific time
-    
+
     Args:
         norad_id: NORAD catalog number
         target_time: ISO format datetime string (e.g., '2024-01-15T12:00:00Z')
-    
+
     Returns:
         Dictionary with position (km) and velocity (km/s) vectors in TEME frame
     """
-    logger.info(f"Tool 'propagate_orbit' invoked. ID: {norad_id}, Target Time: {target_time}")
+    logger.info("Tool 'propagate_orbit' invoked",
+                extra={"norad_id": norad_id, "target_time": target_time})
 
-    # Get TLE data using internal function
     tle_data = _get_tle_data_internal(norad_id)
     if not tle_data.get("success"):
-        logger.error(f"Propagation aborted: TLE fetch failed for ID {norad_id}")
+        logger.error("Propagation aborted: TLE fetch failed",
+                     extra={"norad_id": norad_id})
         return tle_data
-    
+
     # Parse TLE
     try:
         sat = parse_tle(tle_data["line1"], tle_data["line2"])
     except Exception as e:
-        logger.error(f"Failed to parse TLE for ID {norad_id}: {e}", exc_info=True)
+        logger.error("Failed to parse TLE",
+                     extra={"norad_id": norad_id, "error": str(e)})
         return {
-            "success": False,
-            "error": f"Failed to parse TLE: {str(e)}",
-            "norad_id": norad_id
+            "success":  False,
+            "error":    f"Failed to parse TLE: {str(e)}",
+            "norad_id": norad_id,
         }
-    
+
     # Parse target time
     try:
-        dt = datetime.fromisoformat(target_time.replace('Z', '+00:00'))
+        dt = datetime.fromisoformat(target_time.replace("Z", "+00:00"))
         jd, fr = datetime_to_jd(dt)
     except Exception as e:
-        logger.error(f"Invalid datetime format '{target_time}': {e}")
+        logger.error("Invalid datetime format",
+                     extra={"target_time": target_time, "error": str(e)})
         return {
-            "success": False,
-            "error": f"Invalid datetime format: {str(e)}",
-            "norad_id": norad_id
+            "success":  False,
+            "error":    f"Invalid datetime format: {str(e)}",
+            "norad_id": norad_id,
         }
-    
+
     # Propagate
     try:
         error_code, position, velocity = sat.sgp4(jd, fr)
-        
-        if error_code != 0:
-            logger.warning(f"SGP4 propagation error code {error_code} for ID {norad_id}")
-            return {
-                "success": False,
-                "error": f"SGP4 error code: {error_code}",
-                "norad_id": norad_id
-            }
-        
-        speed = float(np.linalg.norm(velocity))
-        logger.info(f"Propagation successful for ID {norad_id}. Speed: {speed:.3f} km/s")
 
+        if error_code != 0:
+            logger.warning("SGP4 propagation error",
+                           extra={"norad_id": norad_id, "error_code": error_code})
+            return {
+                "success":  False,
+                "error":    f"SGP4 error code: {error_code}",
+                "norad_id": norad_id,
+            }
+
+        speed = float(np.linalg.norm(velocity))
+        logger.info("Propagation successful",
+                    extra={"norad_id": norad_id, "speed_km_s": round(speed, 3)})
+
+        # FIX: Safe naming
         return {
-            "success": True,
-            "norad_id": norad_id,
-            "name": tle_data["name"],
-            "epoch": target_time,
-            "position_km": list(position),
+            "success":      True,
+            "norad_id":     norad_id,
+            "name":         tle_data.get("name", f"NORAD {norad_id}"),
+            "epoch":        target_time,
+            "position_km":  list(position),
             "velocity_km_s": list(velocity),
             "magnitude_km": float(np.linalg.norm(position)),
-            "speed_km_s": speed
+            "speed_km_s":   speed,
         }
-    
+
     except Exception as e:
-        logger.error(f"Propagation algorithm failed: {e}", exc_info=True)
+        logger.error("Propagation algorithm failed",
+                     extra={"norad_id": norad_id, "error": str(e)})
         return {
-            "success": False,
-            "error": f"Propagation failed: {str(e)}",
-            "norad_id": norad_id
+            "success":  False,
+            "error":    f"Propagation failed: {str(e)}",
+            "norad_id": norad_id,
         }
+
 
 @mcp.tool()
 def calculate_miss_distance(
@@ -183,222 +180,213 @@ def calculate_miss_distance(
     id_2: int,
     start_time: str,
     end_time: str,
-    time_step_seconds: int = 60
+    time_step_seconds: int = 60,
 ) -> Dict:
     """
     Calculate minimum miss distance between two objects over a time window
-    
-    Args:
-        id_1: NORAD ID of first object
-        id_2: NORAD ID of second object
-        start_time: Start of analysis window (ISO format)
-        end_time: End of analysis window (ISO format)
-        time_step_seconds: Time step for propagation (default 60s)
-    
-    Returns:
-        Dictionary with minimum distance, time of closest approach, and relative velocity
     """
-    logger.info(f"Tool 'calculate_miss_distance' invoked. ID1: {id_1}, ID2: {id_2}, Window: {start_time} to {end_time}, Step: {time_step_seconds}s")
-    
-    # Get TLE data for both objects using internal function
+    logger.info(
+        "Tool 'calculate_miss_distance' invoked",
+        extra={"id1": id_1, "id2": id_2, "step_s": time_step_seconds},
+    )
+
     tle1 = _get_tle_data_internal(id_1)
     tle2 = _get_tle_data_internal(id_2)
-    
+
     if not tle1.get("success") or not tle2.get("success"):
-        logger.error("Aborting miss distance calc: TLE fetch failed.")
+        logger.error("Aborting miss distance calc: TLE fetch failed")
         return {
             "success": False,
-            "error": "Failed to fetch TLE data for one or both objects"
+            "error":   "Failed to fetch TLE data for one or both objects",
         }
-    
+
     # Parse TLEs
     try:
         sat1 = parse_tle(tle1["line1"], tle1["line2"])
         sat2 = parse_tle(tle2["line1"], tle2["line2"])
     except Exception as e:
-        logger.error(f"TLE parsing error: {e}")
-        return {
-            "success": False,
-            "error": f"Failed to parse TLEs: {str(e)}"
-        }
-    
+        logger.error("TLE parsing error", extra={"error": str(e)})
+        return {"success": False, "error": f"Failed to parse TLEs: {str(e)}"}
+
     # Parse times
     try:
-        start_dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
-        end_dt = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
+        start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+        end_dt   = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
     except Exception as e:
-        logger.error(f"Date parsing error: {e}")
-        return {
-            "success": False,
-            "error": f"Invalid datetime format: {str(e)}"
-        }
-    
+        logger.error("Date parsing error", extra={"error": str(e)})
+        return {"success": False, "error": f"Invalid datetime format: {str(e)}"}
+
     logger.info("Starting propagation loop for close approach analysis...")
-    
-    # Propagate and find minimum distance
-    min_distance = float('inf')
-    tca_time = None
-    tca_pos1 = None
-    tca_pos2 = None
-    tca_vel1 = None
-    tca_vel2 = None
-    
-    current_dt = start_dt
+
+    min_distance = float("inf")
+    tca_time = tca_pos1 = tca_pos2 = tca_vel1 = tca_vel2 = None
     steps_calculated = 0
-    
+    current_dt = start_dt
+
     while current_dt <= end_dt:
         jd, fr = datetime_to_jd(current_dt)
-        
+
         error1, pos1, vel1 = sat1.sgp4(jd, fr)
         error2, pos2, vel2 = sat2.sgp4(jd, fr)
-        
+
         if error1 == 0 and error2 == 0:
-            distance = np.linalg.norm(np.array(pos1) - np.array(pos2))
-            
+            distance = float(np.linalg.norm(np.array(pos1) - np.array(pos2)))
             if distance < min_distance:
                 min_distance = distance
-                tca_time = current_dt
-                tca_pos1 = pos1
-                tca_pos2 = pos2
-                tca_vel1 = vel1
-                tca_vel2 = vel2
-        
+                tca_time     = current_dt
+                tca_pos1     = pos1
+                tca_pos2     = pos2
+                tca_vel1     = vel1
+                tca_vel2     = vel2
+
         current_dt += timedelta(seconds=time_step_seconds)
         steps_calculated += 1
-    
-    logger.info(f"Propagation loop completed. {steps_calculated} steps analyzed.")
-    
+
+    logger.info("Propagation loop completed",
+                extra={"steps": steps_calculated})
+
     if tca_time is None:
-        logger.warning("No valid propagation data found in time window.")
+        logger.warning("No valid propagation data found in time window")
         return {
             "success": False,
-            "error": "No valid propagation data found in time window"
+            "error":   "No valid propagation data found in time window",
         }
-    
+
     # Calculate relative velocity
-    rel_velocity = np.array(tca_vel1) - np.array(tca_vel2)
-    rel_speed_km_s = float(np.linalg.norm(rel_velocity))
-    
+    rel_velocity     = np.array(tca_vel1) - np.array(tca_vel2)
+    rel_speed_km_s   = float(np.linalg.norm(rel_velocity))
+
     # Determine collision geometry
-    pos_diff = np.array(tca_pos1) - np.array(tca_pos2)
+    pos_diff      = np.array(tca_pos1) - np.array(tca_pos2)
     pos_diff_unit = pos_diff / np.linalg.norm(pos_diff)
-    rel_vel_unit = rel_velocity / (np.linalg.norm(rel_velocity) + 1e-10)
-    
-    # Dot product gives collision angle (-1 = head-on, +1 = chasing)
+    rel_vel_unit  = rel_velocity / (np.linalg.norm(rel_velocity) + 1e-10)
+
     collision_angle_cos = float(np.dot(pos_diff_unit, rel_vel_unit))
-    collision_type = "head-on" if collision_angle_cos < -0.5 else "chasing" if collision_angle_cos > 0.5 else "crossing"
-    
-    logger.info(f"TCA Found: {tca_time.isoformat()} | Min Dist: {min_distance:.2f} km | Type: {collision_type}")
-    
+    if collision_angle_cos < -0.5:
+        collision_type = "head-on"
+    elif collision_angle_cos > 0.5:
+        collision_type = "chasing"
+    else:
+        collision_type = "crossing"
+
+    logger.info(
+        "TCA found",
+        extra={
+            "tca":        tca_time.isoformat(),
+            "min_dist_km": round(min_distance, 2),
+            "type":        collision_type,
+        },
+    )
+
+    # FIX: Safe naming
     return {
-        "success": True,
-        "object_1": {"norad_id": id_1, "name": tle1["name"]},
-        "object_2": {"norad_id": id_2, "name": tle2["name"]},
-        "minimum_distance_km": float(min_distance),
+        "success":                True,
+        "object_1":               {"norad_id": id_1, "name": tle1.get("name", f"NORAD {id_1}")},
+        "object_2":               {"norad_id": id_2, "name": tle2.get("name", f"NORAD {id_2}")},
+        "minimum_distance_km":    float(min_distance),
         "time_of_closest_approach": tca_time.isoformat(),
-        "relative_speed_km_s": rel_speed_km_s,
-        "relative_speed_m_s": rel_speed_km_s * 1000,
+        "relative_speed_km_s":    rel_speed_km_s,
+        "relative_speed_m_s":     rel_speed_km_s * 1000,
         "collision_angle_cosine": collision_angle_cos,
-        "collision_type": collision_type,
-        "object_1_position_km": list(tca_pos1),
-        "object_2_position_km": list(tca_pos2),
+        "collision_type":         collision_type,
+        "object_1_position_km":   list(tca_pos1),
+        "object_2_position_km":   list(tca_pos2),
         "object_1_velocity_km_s": list(tca_vel1),
-        "object_2_velocity_km_s": list(tca_vel2)
+        "object_2_velocity_km_s": list(tca_vel2),
     }
+
 
 @mcp.tool()
 def detect_maneuver(
     norad_id: int,
     reference_time: str,
-    lookback_hours: int = 48
+    lookback_hours: int = 48,
 ) -> Dict:
     """
-    Detect if a satellite performed a maneuver in the lookback period
-    
-    Args:
-        norad_id: NORAD catalog number
-        reference_time: Reference time (ISO format)
-        lookback_hours: Hours to look back (default 48)
-    
-    Returns:
-        Dictionary indicating if maneuver detected and velocity statistics
+    Classify satellite operational status.
     """
-    logger.info(f"Tool 'detect_maneuver' invoked. ID: {norad_id}, Ref Time: {reference_time}, Lookback: {lookback_hours}h")
+    logger.info("Tool 'detect_maneuver' invoked",
+                extra={"norad_id": norad_id, "lookback_h": lookback_hours})
 
-    # Use internal function
     tle_data = _get_tle_data_internal(norad_id)
     if not tle_data.get("success"):
-        logger.error(f"Maneuver detection aborted: TLE fetch failed for ID {norad_id}")
+        logger.error("Maneuver detection aborted: TLE fetch failed",
+                     extra={"norad_id": norad_id})
         return tle_data
-    
-    try:
-        sat = parse_tle(tle_data["line1"], tle_data["line2"])
-        ref_dt = datetime.fromisoformat(reference_time.replace('Z', '+00:00'))
-    except Exception as e:
-        logger.error(f"Setup failed for maneuver detection: {e}")
-        return {
-            "success": False,
-            "error": f"Setup failed: {str(e)}"
-        }
-    
-    # Sample velocity at multiple points
-    velocities = []
-    times = []
-    
-    logger.debug("Sampling historical velocities...")
-    for hours_back in range(0, lookback_hours + 1, 6):  # Sample every 6 hours
-        sample_dt = ref_dt - timedelta(hours=hours_back)
-        jd, fr = datetime_to_jd(sample_dt)
-        
-        error, pos, vel = sat.sgp4(jd, fr)
-        if error == 0:
-            velocities.append(np.linalg.norm(vel))
-            times.append(hours_back)
-    
-    if len(velocities) < 2:
-        logger.warning(f"Insufficient data points ({len(velocities)}) for maneuver detection.")
-        return {
-            "success": False,
-            "error": "Insufficient data points for maneuver detection"
-        }
-    
-    # Calculate statistics
-    vel_array = np.array(velocities)
-    vel_mean = float(np.mean(vel_array))
-    vel_std = float(np.std(vel_array))
-    vel_max_change = float(np.max(np.abs(np.diff(vel_array))))
-    
-    # Maneuver detected if velocity change exceeds threshold (0.0005 km/s = 0.5 m/s)
-    maneuver_detected = vel_max_change > 0.0005 or vel_std > 0.0003
-    
-    # Classify object status
-    if maneuver_detected:
-        status = "ACTIVE"
-    elif vel_std < 0.0001:
-        status = "DRIFTING"
-    else:
-        status = "UNCERTAIN"
-    
-    logger.info(f"Maneuver Analysis Complete. Status: {status} | Max Change: {vel_max_change:.6f} km/s | Detected: {maneuver_detected}")
 
+    line1 = tle_data["line1"]
+    line2 = tle_data["line2"]
+    
+    # FIX: Safe extraction of the name
+    raw_name = tle_data.get("sat_name") or tle_data.get("name") or f"NORAD {norad_id}"
+    name  = raw_name.upper()
+
+    # ── Epoch staleness ───────────────────────────────────────────────────
+    try:
+        sat         = Satrec.twoline2rv(line1, line2)
+        epoch_jd    = sat.jdsatepoch + sat.jdsatepochF
+        now_dt      = datetime.now(timezone.utc)
+        now_jd      = 2440587.5 + now_dt.timestamp() / 86400.0
+        epoch_age_d = now_jd - epoch_jd
+        bstar       = sat.bstar
+    except Exception as exc:
+        logger.warning("SGP4 epoch parse error",
+                       extra={"norad_id": norad_id, "error": str(exc)})
+        epoch_age_d = 0.0
+        bstar       = 0.0
+
+    # ── Classification rules (ordered by confidence) ──────────────────────
+    DEBRIS_TOKENS = {"DEB", "R/B", "ROCKET", "STAGE", "FRAG", "ARIANE", "CZ-"}
+    is_debris_name = any(tok in name for tok in DEBRIS_TOKENS)
+    is_stale       = epoch_age_d > 30
+    is_high_drag   = abs(bstar) > 0.01
+
+    if is_debris_name or is_high_drag:
+        status            = "DRIFTING"
+        maneuver_detected = False
+        confidence        = "HIGH" if is_debris_name else "MEDIUM"
+    elif is_stale:
+        status            = "UNCERTAIN"
+        maneuver_detected = False
+        confidence        = "LOW"
+    else:
+        status            = "ACTIVE"
+        maneuver_detected = True
+        confidence        = "MEDIUM"
+
+    logger.info(
+        "Maneuver classification complete",
+        extra={
+            "norad_id":        norad_id,
+            "status":          status,
+            "confidence":      confidence,
+            "epoch_age_days":  round(epoch_age_d, 1),
+            "bstar":           bstar,
+        },
+    )
+
+    # FIX: Ensure sat_name is always passed safely
     return {
-        "success": True,
-        "norad_id": norad_id,
-        "name": tle_data["name"],
-        "maneuver_detected": maneuver_detected,
-        "status": status,
-        "velocity_mean_km_s": vel_mean,
-        "velocity_std_km_s": vel_std,
-        "max_velocity_change_km_s": vel_max_change,
-        "max_velocity_change_m_s": vel_max_change * 1000,
+        "success":                   True,
+        "norad_id":                  norad_id,
+        "sat_name":                  raw_name,
+        "maneuver_detected":         maneuver_detected,
+        "status":                    status,
+        "classification_confidence": confidence,
+        "epoch_age_days":            round(epoch_age_d, 1),
+        "bstar":                     bstar,
+        "method":                    "name_heuristic+epoch_age+bstar",
+        "limitation": (
+            "Single-TLE velocity comparison is not a valid maneuver detector. "
+            "Status inferred from object name, epoch age, and BSTAR coefficient."
+        ),
         "lookback_hours": lookback_hours,
-        "samples_analyzed": len(velocities)
     }
 
+
 if __name__ == "__main__":
-    # Run the MCP server
     logger.info("Starting Orbital Mechanics MCP Server loop...")
     try:
         mcp.run()
     except Exception as e:
-        logger.critical(f"MCP Server crashed: {e}", exc_info=True)
+        logger.critical("MCP Server crashed", extra={"error": str(e)})
