@@ -13,6 +13,14 @@ A production-grade, multi-agent AI system that autonomously adjudicates liabilit
 
 ---
 
+## 🌐 Live Application
+
+**[https://orbital-jurist.netlify.app/](https://orbital-jurist.netlify.app/)**
+
+The UI is hosted on Netlify and connects to the FastAPI backend. No installation required to try the demo.
+
+---
+
 ## Table of Contents
 
 - [Overview](#overview)
